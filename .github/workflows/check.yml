@@ -35,13 +35,21 @@ jobs:
       - name: Install dependencies
         run: pip install --disable-pip-version-check --no-input -r requirements.txt
 
-      - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
+      - name: Get VPN Gate nodes + SSTP check + build page
         run: python vpngate.py
         env:
-            # 改成你自己的 Worker 域名
-          CHECK_WORKER: "https://eris.terminator-sky.net/check?sstp=vpn:vpn@"
+          # --- 检测方式 ---
+          # native (默认): 在 runner 内直接做 TCP + TLS + MS-SSTP 握手, 不依赖任何外部服务。
+          #                 Actions runner 本身在境外, 直连 VPN Gate 中继即可。
+          # worker       : 调用外部检测接口。需自备可用端点并填 CHECK_WORKER。
+          #   ⚠️ 2026-10 起 Cloudflare 对代理类 Worker 做了账号级风控 (Error 1101),
+          #      把检测放在 CF Worker 上会被一并拦截, 因此默认改用 native。
+          CHECK_MODE: "native"
           CHECK_CONCURRENCY: "32"
-          CHECK_TIMEOUT: "90"
+          SSTP_TIMEOUT: "12"
+          # 仅在 CHECK_MODE=worker 时需要:
+          # CHECK_WORKER: "https://<你的检测端点>/check?sstp=vpn:vpn@"
+          # CHECK_TIMEOUT: "90"
 
           # --- edgetunnel 订阅配置 (生成 chains.txt / hosts.txt / sub.txt 用) ---
           # EDT_UUID 必须和你的 Worker 实际使用的 UUID 完全一致, 否则客户端连不上。
@@ -52,7 +60,7 @@ jobs:
           # 启用步骤:
           #   1) Settings -> Secrets and variables -> Actions -> New secret, 名为 EDT_UUID
           #   2) 去掉下面这行行首的 "# " (不建 Secret 就直接启用, 脚本会因为拿到空串而报错停止)
-          EDT_UUID: ${{ secrets.EDT_UUID }}
+          # EDT_UUID: ${{ secrets.EDT_UUID }}
           #
           # 下面两个有默认值, 显式写出来只是为了让你知道在哪改:
           EDT_DOMAIN: "discordia.terminator-sky.net"
