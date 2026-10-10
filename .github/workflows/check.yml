@@ -60,7 +60,7 @@ jobs:
           # 启用步骤:
           #   1) Settings -> Secrets and variables -> Actions -> New secret, 名为 EDT_UUID
           #   2) 去掉下面这行行首的 "# " (不建 Secret 就直接启用, 脚本会因为拿到空串而报错停止)
-          # EDT_UUID: ${{ secrets.EDT_UUID }}
+          EDT_UUID: ${{ secrets.EDT_UUID }}
           #
           # 下面两个有默认值, 显式写出来只是为了让你知道在哪改:
           EDT_DOMAIN: "discordia.terminator-sky.net"
