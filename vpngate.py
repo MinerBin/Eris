@@ -708,4 +708,23 @@ def main():
         die("本次检测 0 个节点可用 — 不覆盖线上已有清单 (VPN Gate 可能集体波动, 30 分钟后自动重试)")
 
     # 4) 结果 + 网页
-    data = build_outputs(results, raw_count, sstp_count, so
+    data = build_outputs(results, raw_count, sstp_count, source)
+    log("RESULT", f"可用节点: {len(success)}")
+    log("RESULT", f"国家数量: {data['stats']['countries']}")
+
+    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
+    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
+    log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        die(f"程序异常: {type(exc).__name__}: {exc}")
