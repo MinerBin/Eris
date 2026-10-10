@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VPN Gate SSTP 节点检测</title>
+<style>
+  :root {
+    --bg: #0b1120; --panel: #111a2e; --panel2: #16233c; --border: #243450;
+    --text: #dbe7ff; --muted: #7f93b8; --accent: #4cc2ff; --ok: #2fd08a;
+    --res: #b48cff; --dc: #ffb84d; --unk: #8a9bb5;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; min-height: 100vh; padding: 20px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .card .k { color: var(--muted); font-size: 12px; }
+  .card .v { font-size: 24px; font-weight: 700; margin-top: 4px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+  .pill { background: var(--panel2); border: 1px solid var(--border); color: var(--text); border-radius: 999px; padding: 6px 14px; font-size: 13px; cursor: pointer; user-select: none; }
+  .pill.on { border-color: var(--accent); color: var(--accent); }
+  .legend { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  .country { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 14px; overflow: hidden; }
+  .country .head { display: flex; justify-content: space-between; padding: 12px 16px; background: var(--panel2); font-weight: 600; cursor: pointer; flex-wrap: wrap; gap: 6px; }
+  .country .head .tag { font-size: 12px; color: var(--muted); font-weight: 400; }
+  /* 点击标题折叠/展开。默认展开, 所以不加类时外观与以前完全一样 */
+  .country.collapsed table { display: none; }
+  .country .head .caret { color: var(--muted); font-weight: 400; transition: transform .15s; }
+  .country.collapsed .head .caret { transform: rotate(-90deg); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 9px 12px; text-align: left; border-top: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr:hover td { background: rgba(76,194,255,.05); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; }
+  .b-res { background: rgba(180,140,255,.15); color: var(--res); }
+  .b-dc { background: rgba(255,184,77,.15); color: var(--dc); }
+  .b-unk { background: rgba(138,155,181,.15); color: var(--unk); }
+  .lat { color: var(--ok); }
+  code { background: var(--panel2); padding: 2px 6px; border-radius: 5px; font-size: 12px; cursor: pointer; }
+  code:hover { outline: 1px solid var(--accent); }
+  .empty { color: var(--muted); padding: 30px; text-align: center; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: center; }
+  @media (max-width: 700px) { th, td { padding: 7px 8px; } .hide-m { display: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>VPN Gate · SSTP 节点检测</h1>
+  <div class="sub">节点来自 VPN Gate（仅 TCP 入口中继），检测由 Cloudflare Worker 执行，GitHub Actions 定时刷新</div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="bar">
+    <span class="pill on" data-f="all">全部</span>
+    <span class="pill" data-f="residential">住宅 IP</span>
+    <span class="pill" data-f="datacenter">数据中心</span>
+    <span class="pill" data-f="unknown">未识别</span>
+  </div>
+  <div class="legend">「住宅 / 数据中心」为基于中继注册类型与出口运营商的估算，非严格判定。</div>
+
+  <div id="countries"></div>
+
+  <div class="footer" id="foot">加载中…</div>
+</div>
+
+<script>
+let DATA = null, FILTER = "all";
+
+function copyLink(text) {
+  // 复制必须有反馈: 原来是静默调用, 失败时用户点了没反应, 会误以为已经复制成功
+  function done(ok) {
+    const foot = document.getElementById("foot");
+    const backup = foot.textContent;
+    foot.textContent = ok ? ("已复制: " + text) : "复制失败, 请手动选中 host:port 复制";
+    setTimeout(function () { foot.textContent = backup; }, 2000);
+  }
+  // 安全上下文 (HTTPS) 优先用异步剪贴板 API
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(
+      function () { done(true); },
+      function () { done(false); }
+    );
+    return;
+  }
+  // 回退: 非安全上下文 / 老浏览器 -> 临时 textarea + execCommand
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    done(ok);
+  } catch (e) {
+    done(false);
+  }
+}
+
+// 所有来自 data.json 的字符串, 拼进 HTML 前必须先过这个函数 (防 XSS)
+function esc(v) {
+  if (v === null || v === undefined) return "";
+  return String(v)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderCards(d) {
+  const s = d.stats || {};
+  const items = [
+    ["最后更新", d.generated_at || "-", "时区 UTC"],
+    ["SSTP 节点", s.sstp_nodes, "筛选自 VPN Gate"],
+    ["已检测", s.checked, "提交给 Worker"],
+    ["可用节点", s.success, "success = true"],
+    ["国家数量", s.countries, "按可用节点统计"],
+    ["住宅(估算)", s.residential_est, "数据中心 " + (s.datacenter_est || 0)]
+  ];
+  document.getElementById("cards").innerHTML = items.map(function (x) {
+    return '<div class="card"><div class="k">' + esc(x[0]) + '</div><div class="v">' + esc(x[1]) + '</div><div class="k">' + esc(x[2]) + '</div></div>';
+  }).join("");
+}
+
+function rowHtml(n) {
+  let badge;
+  if (n.residential === "residential") badge = '<span class="badge b-res">住宅</span>';
+  else if (n.residential === "datacenter") badge = '<span class="badge b-dc">机房</span>';
+  else badge = '<span class="badge b-unk">未知</span>';
+  const exit = n.exit ? ((n.exit.ip || "?") + " · " + (n.exit.org || n.exit.country || "")) : "-";
+  const date = (n.checked_at || "").split(" ")[0];
+  return '<tr>' +
+    '<td><code title="点击复制 sstp 链接">' + esc(n.host) + ':' + esc(n.port) + '</code></td>' +
+    '<td class="hide-m">' + esc(n.country_code || "") + '</td>' +
+    '<td>SSTP</td>' +
+    '<td class="lat">' + (n.latency_ms != null ? esc(n.latency_ms) + ' ms' : '-') + '</td>' +
+    '<td class="hide-m" style="color:var(--muted)">' + esc(exit) + '</td>' +
+    '<td>' + badge + '</td>' +
+    '<td class="hide-m" style="color:var(--muted)">' + esc(date) + '</td>' +
+    '</tr>';
+}
+
+function renderCountries() {
+  const box = document.getElementById("countries");
+  const entries = Object.entries(DATA.countries || {})
+    .map(function (x) {
+      const g = x[1] || {};
+      const nodes = (Array.isArray(g.nodes) ? g.nodes : []).filter(function (n) { return FILTER === "all" || n.residential === FILTER; });
+      return [x[0], Object.assign({}, g, { nodes: nodes, count: nodes.length })];
+    })
+    .filter(function (x) { return x[1].nodes.length > 0; })
+    .sort(function (a, b) { return (b[1].count || 0) - (a[1].count || 0); });
+
+  if (!entries.length) {
+    box.innerHTML = '<div class="country"><div class="empty">没有符合当前筛选的可用节点（本轮 Worker 判定全部不可用或无数据）</div></div>';
+    return;
+  }
+  box.innerHTML = entries.map(function (x) {
+    const name = x[0], g = x[1];
+    return '<div class="country">' +
+      '<div class="head" role="button" tabindex="0">' +
+        '<span><span class="caret">▾</span> 🌏 ' + esc(name) + ' <span class="tag">' + esc(g.code || "") + '</span></span>' +
+        '<span class="tag">' + esc(g.count) + ' 个节点 · 住宅 ' + esc(g.residential) + ' · 机房 ' + esc(g.datacenter) + '</span>' +
+      '</div>' +
+      '<table><thead><tr><th>Host:Port</th><th class="hide-m">国码</th><th>协议</th><th>延迟</th><th class="hide-m">出口</th><th>类型</th><th class="hide-m">检测日期</th></tr></thead>' +
+      '<tbody>' + g.nodes.map(rowHtml).join("") + '</tbody></table>' +
+    '</div>';
+  }).join("");
+}
+
+function render() {
+  renderCards(DATA);
+  renderCountries();
+  const s = DATA.stats || {};
+  document.getElementById("foot").textContent =
+    "数据时间 " + (DATA.generated_at || "?") + " · 来源 " + (DATA.source || "?") + " · 可用 " + (s.success || 0) + " / 检测 " + (s.checked || 0) + " · 点击 host:port 复制 sstp 链接";
+}
+
+function setFilter(f) {
+  FILTER = f;
+  document.querySelectorAll(".pill").forEach(function (p) { p.classList.toggle("on", p.dataset.f === f); });
+  renderCountries();
+}
+document.querySelectorAll(".pill").forEach(function (p) { p.addEventListener("click", function () { setFilter(p.dataset.f); }); });
+
+// 点击国家标题折叠/展开。用事件委托, 而不是在生成的 HTML 里写内联 onclick:
+// 内联事件处理器会被页面的 CSP (script-src 未含 'unsafe-inline') 拦掉, 点了没反应。
+// 委托挂在常驻的 #countries 上, 重绘列表也不会丢。
+function toggleCountry(head) {
+  const box = head.closest(".country");
+  if (box) box.classList.toggle("collapsed");
+}
+document.getElementById("countries").addEventListener("click", function (e) {
+  const head = e.target.closest(".country .head");
+  if (head) toggleCountry(head);
+});
+document.getElementById("countries").addEventListener("keydown", function (e) {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const head = e.target.closest(".country .head");
+  if (!head) return;
+  e.preventDefault();
+  toggleCountry(head);
+});
+
+// 点击 host:port 复制 sstp://vpn:vpn@host:port
+document.addEventListener("click", function (e) {
+  const code = e.target.closest("code");
+  if (!code) return;
+  // textContent 可能带缩进/换行, 先 trim; 用 ^...$ 整串匹配, 避免从中间误切
+  const m = code.textContent.trim().match(/^(.+):(\d+)$/);
+  if (!m) return;
+  const host = m[1].trim();
+  const port = parseInt(m[2], 10);
+  // 只复制看起来合法的 host:port, 防止把异常内容塞进剪贴板
+  if (!host || !(port > 0 && port <= 65535)) return;
+  copyLink("sstp://vpn:vpn@" + host + ":" + port);
+});
+
+async function load() {
+  try {
+    const r = await fetch("data.json", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const fresh = await r.json();
+    // 数据没变就跳过重绘: 否则每分钟一次整页重排, 会把用户手动折叠/展开的状态重置掉
+    if (DATA && fresh && fresh.generated_at === DATA.generated_at) return;
+    DATA = fresh;
+    render();
+  } catch (err) {
+    document.getElementById("foot").textContent = "data.json 加载失败: " + err + "（等待下一次 Action 生成）";
+  }
+}
+load();
+// 每 60s 刷新一次, 但只在页面可见时; 页面重新可见时立即补一次, 保证回来就看到最新
+setInterval(function () { if (!document.hidden) load(); }, 60000);
+document.addEventListener("visibilitychange", function () { if (!document.hidden) load(); });
+</script>
+</body>
+</html>
