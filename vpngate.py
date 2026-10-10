@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -44,7 +45,9 @@ for _stream in (sys.stdout, sys.stderr):
 # ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
+# 官方接口优先走 https, 失败自动回退 http (两种都提供)
+VPNGATE_API = os.environ.get("VPNGATE_API", "https://www.vpngate.net/api/iphone/")
+VPNGATE_API_HTTP = os.environ.get("VPNGATE_API_HTTP", "http://www.vpngate.net/api/iphone/")
 # 官方接口失败时的回退数据源: 预解析 JSON 镜像 (字段与官方 CSV 同源)
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
@@ -121,22 +124,23 @@ def die(msg):
 def fetch_vpngate():
     """返回 (rows, source)。rows: [{host, ip, country_long, country_short, config_b64}]
     官方 API 失败时回退镜像 JSON; 两个都失败 -> 直接 die (exit 1)。"""
-    # --- 主源: 官方 CSV ---
-    try:
-        log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
-        resp = requests.get(
-            VPNGATE_API,
-            timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
-        )
-        resp.raise_for_status()
-        rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
-    except Exception as exc:
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
+    # --- 主源: 官方 CSV (先 https, 不通再 http) ---
+    for api in (VPNGATE_API, VPNGATE_API_HTTP):
+        try:
+            log("VPN GATE", f"获取官方 API: {api}")
+            resp = requests.get(
+                api,
+                timeout=HTTP_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
+            )
+            resp.raise_for_status()
+            rows = parse_csv(resp.text)
+            if rows:
+                log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
+                return rows, "vpngate.net/api/iphone"
+            raise RuntimeError("官方 API 返回 0 行数据")
+        except Exception as exc:
+            log("VPN GATE", f"官方 API 获取失败: {exc}")
 
     # --- 回退源: GitHub 预解析镜像 ---
     try:
@@ -183,21 +187,25 @@ def parse_csv(text):
            "countryshort": idx.get("countryshort", 6),
            "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1)}
 
+    def cell(fields, i):
+        """安全取列: 行字段数不足时返回空串, 避免一行坏数据让整个解析抛 IndexError。"""
+        return fields[i].strip() if 0 <= i < len(fields) else ""
+
     rows = []
     for ln in data_lines:
         fields = next(csv.reader(io.StringIO(ln)))
         if len(fields) < 7:
             continue
-        host = fields[pos["hostname"]].strip()
-        ip = fields[pos["ip"]].strip()
+        host = cell(fields, pos["hostname"])
+        ip = cell(fields, pos["ip"])
         if not host or not ip:
             continue
         rows.append({
             "host": host,
             "ip": ip,
-            "country_long": fields[pos["countrylong"]].strip(),
-            "country_short": fields[pos["countryshort"]].strip(),
-            "config_b64": fields[pos["openvpn_configdata_base64"]].strip(),
+            "country_long": cell(fields, pos["countrylong"]),
+            "country_short": cell(fields, pos["countryshort"]),
+            "config_b64": cell(fields, pos["openvpn_configdata_base64"]),
         })
     return rows
 
@@ -308,7 +316,19 @@ def classify_network(host, exit_org, is_datacenter=None):
     return "unknown"
 
 
-def check_one(node, session):
+# 每个线程一个独立 Session: requests.Session 官方不保证线程安全
+_thread_local = threading.local()
+
+
+def _get_session():
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        _thread_local.session = s
+    return s
+
+
+def check_one(node):
     """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
     单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
     url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
@@ -320,7 +340,7 @@ def check_one(node, session):
     out["exit"] = None
     out["residential"] = "unknown"
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        r = _get_session().get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
@@ -358,11 +378,11 @@ def check_one(node, session):
         return out
 
 
-def check_all(nodes, session):
+def check_all(nodes):
     """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
+        futures = [pool.submit(check_one, n) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -408,7 +428,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 
-CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains.txt")
+CHAIN_URL = os.environ.get("CHAIN_URL", "https://minerbin.github.io/Eris/chains.txt")
 
 
 def build_chains_text(data):
@@ -462,19 +482,20 @@ EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "EDGE_HOSTS",
-        "ikankeji.com:443,cf.3666888.xyz:443,fn.130519.xyz:443，www.vmware.com:443，store.ubi.com:443,op.chinwa.eu.cc:443,w3.org:443,mskcc.org:443,www.people.inc:443",
-    ).split(",")
+        "ikankeji.com:443,cf.3666888.xyz:443,fn.130519.xyz:443,www.vmware.com:443,store.ubi.com:443,"
+        "op.chinwa.eu.cc:443,w3.org:443,mskcc.org:443,www.people.inc:443",
+    ).replace("，", ",").split(",")   # 顺手把误输入的全角逗号归一化, 防止再踩这个坑
     if h.strip()
 ]
 
-HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+HOSTS_URL = os.environ.get("HOSTS_URL", "https://minerbin.github.io/Eris/hosts.txt")
 
 
 def build_hosts_text(data):
     """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
     每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
     countries = data["countries"]
-    # 入口: 默认用 7 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
+    # 入口: 默认用 9 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
     lines = [
@@ -482,7 +503,7 @@ def build_hosts_text(data):
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
-        "# 入口用 7 个实测可用优选域名循环分配",
+        "# 入口用 9 个实测可用优选域名循环分配",
         "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
         "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
@@ -526,7 +547,7 @@ def build_hosts_text(data):
 EDT_UUID = os.environ.get("EDT_UUID", "9c9670b1-d806-4c65-8d95-0cab2c082635")
 EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "discordia.terminator-sky.net")
 EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
-SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
+SUB_URL = os.environ.get("SUB_URL", "https://minerbin.github.io/Eris/sub.txt")
 
 
 def _b64_secret_encode(plaintext, secret):
@@ -644,8 +665,6 @@ def write_outputs(data):
 # main
 # ---------------------------------------------------------------------------
 def main():
-    session = requests.Session()
-
     # 1) 数据源
     rows, source = fetch_vpngate()
     raw_count = len(rows)
@@ -669,7 +688,7 @@ def main():
     # 3) 并发检测
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
-    results = check_all(uniq, session)
+    results = check_all(uniq)
     elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
@@ -684,24 +703,9 @@ def main():
     if uniq and not success and len(worker_errors) == len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
+    # 硬性失败: Worker 正常但 0 个节点通过 -> 不覆盖线上已有清单 (避免把好数据冲成空)
+    if uniq and not success:
+        die("本次检测 0 个节点可用 — 不覆盖线上已有清单 (VPN Gate 可能集体波动, 30 分钟后自动重试)")
+
     # 4) 结果 + 网页
-    data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}")
-    log("RESULT", f"国家数量: {data['stats']['countries']}")
-
-    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
-    log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
-    log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
-    log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as exc:
-        die(f"程序异常: {type(exc).__name__}: {exc}")
+    data = build_outputs(results, raw_count, sstp_count, so
